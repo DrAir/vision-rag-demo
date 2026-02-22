@@ -17,8 +17,8 @@ def load_models():
     """Loads the VLM model for All-Page Scan."""
     global VLM_MODEL, VLM_TOKENIZER
     
-    print("Loading MLX VLM Model (Qwen3-VL-8B)...")
-    VLM_MODEL, VLM_TOKENIZER = load("mlx-community/Qwen3-VL-8B-Instruct-4bit")
+    print("Loading MLX VLM Model (Qwen3-VL-30B-A3B)...")
+    VLM_MODEL, VLM_TOKENIZER = load("mlx-community/Qwen3-VL-30B-A3B-Instruct-3bit")
     print("Model loaded successfully.")
 
 def process_pdf(pdf_file):
@@ -517,14 +517,17 @@ def rag_response_with_page(user_query, selected_page_idx):
 def extract_metadata():
     """
     Automatically extract contract metadata from PDF pages using ALL-PAGE SCAN + VERIFICATION.
-    Returns: contract_number (int), signing_date (str), contract_value (int), duration (str)
+    Returns: contract_number, contract_name, signing_date, contract_value, duration, party_a, party_b, expiry_date, extraction_time
     """
+    import time
+    start_time = time.time()
+    
     if VLM_MODEL is None:
-        return "N/A", "N/A", "N/A", "N/A"
+        return "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "Model not loaded"
     
     images_dir = "temp_pdf_images"
     if not os.path.exists(images_dir):
-        return "N/A", "N/A", "N/A", "N/A"
+        return "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "No PDF"
     
     # ALL-PAGE SCAN: Get ALL pages for thorough metadata extraction (exclude cropped temp files)
     image_files = sorted(
@@ -1052,6 +1055,13 @@ Chỉ trả lời đúng format, mỗi thông tin một dòng. Nếu không tìm
     import gc
     gc.collect()
     
+    # Calculate extraction time
+    elapsed = time.time() - start_time
+    minutes = int(elapsed // 60)
+    seconds = int(elapsed % 60)
+    extraction_time = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+    print(f"\n⏱️ Metadata extraction completed in {extraction_time}")
+    
     return (
         results.get('contract_number', 'N/A'),
         results.get('contract_name', 'N/A'),
@@ -1060,7 +1070,8 @@ Chỉ trả lời đúng format, mỗi thông tin một dòng. Nếu không tìm
         results.get('duration', 'N/A'),
         results.get('party_a', 'N/A'),
         results.get('party_b', 'N/A'),
-        results.get('expiry_date', 'N/A')
+        results.get('expiry_date', 'N/A'),
+        extraction_time
     )
 
 
@@ -1068,7 +1079,7 @@ Chỉ trả lời đúng format, mỗi thông tin một dòng. Nếu không tìm
 with gr.Blocks(title="Local Vision RAG (MacOS M5)", css="""
     .gallery-item { cursor: pointer; }
 """) as demo:
-    gr.Markdown("# 👁️ Local Vision RAG Demo\n**Retrieval:** Byaldi (ColPali) | **Generation:** MLX-VLM (Qwen3-VL)")
+    gr.Markdown("# 👁️ Local Vision RAG Demo\n**Retrieval:** Byaldi (ColPali) | **Generation:** MLX-VLM (Qwen3-VL-30B-A3B-3bit)")
     
     with gr.Row():
         with gr.Column(scale=1):
@@ -1081,16 +1092,17 @@ with gr.Blocks(title="Local Vision RAG (MacOS M5)", css="""
     gr.Markdown("### 📋 Metadata Extraction")
     with gr.Row():
         extract_btn = gr.Button("🔍 Extract Metadata", variant="secondary")
+        extraction_time_output = gr.Textbox(label="⏱️ Thời gian trích xuất", interactive=False, scale=1)
     with gr.Row():
-        contract_number_output = gr.Textbox(label="Số hợp đồng", interactive=False, scale=1)
-        contract_name_output = gr.Textbox(label="Tên hợp đồng", interactive=False, scale=2)
-        signing_date_output = gr.Textbox(label="Ngày ký hợp đồng", interactive=False, scale=1)
-        contract_value_output = gr.Textbox(label="Giá trị hợp đồng (VNĐ)", interactive=False, scale=1)
-        duration_output = gr.Textbox(label="Thời gian thực hiện", interactive=False, scale=1)
+        contract_number_output = gr.Textbox(label="Số hợp đồng", interactive=True, scale=1)
+        contract_name_output = gr.Textbox(label="Tên hợp đồng", interactive=True, scale=2)
+        signing_date_output = gr.Textbox(label="Ngày ký hợp đồng", interactive=True, scale=1)
+        contract_value_output = gr.Textbox(label="Giá trị hợp đồng (VNĐ)", interactive=True, scale=1)
+        duration_output = gr.Textbox(label="Thời gian thực hiện", interactive=True, scale=1)
     with gr.Row():
-        party_a_output = gr.Textbox(label="Bên A", interactive=False, scale=1)
-        party_b_output = gr.Textbox(label="Bên B", interactive=False, scale=1)
-        expiry_date_output = gr.Textbox(label="Ngày hết hạn", interactive=False, scale=1)
+        party_a_output = gr.Textbox(label="Bên A", interactive=True, scale=1)
+        party_b_output = gr.Textbox(label="Bên B", interactive=True, scale=1)
+        expiry_date_output = gr.Textbox(label="Ngày hết hạn", interactive=True, scale=1)
     
     gr.Markdown("---")
     
@@ -1148,7 +1160,7 @@ with gr.Blocks(title="Local Vision RAG (MacOS M5)", css="""
     extract_btn.click(
         fn=extract_metadata,
         inputs=[],
-        outputs=[contract_number_output, contract_name_output, signing_date_output, contract_value_output, duration_output, party_a_output, party_b_output, expiry_date_output]
+        outputs=[contract_number_output, contract_name_output, signing_date_output, contract_value_output, duration_output, party_a_output, party_b_output, expiry_date_output, extraction_time_output]
     )
 
 if __name__ == "__main__":
