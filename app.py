@@ -1,6 +1,10 @@
 import gradio as gr
 import os
 import shutil
+import json
+import urllib.request
+import urllib.error
+from datetime import datetime
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from pdf2image import convert_from_path
@@ -13,6 +17,19 @@ VLM_TOKENIZER = None
 # Global Metadata Storage (for context in Q&A)
 EXTRACTED_METADATA = {}
 
+# Track current PDF filename
+CURRENT_PDF_FILENAME = ""
+CURRENT_INVOICE_FILENAME = ""
+
+# Data file paths
+METADATA_RECORDS_FILE = "metadata_records.json"
+INVOICE_RECORDS_FILE = "invoice_records.json"
+
+# Batch invoice processing
+ALL_INVOICE_RESULTS = []  # List of dicts, 1 per page
+INVOICE_PAGE_PATHS = []   # List of image paths for invoice pages only
+CONFIRMED_INVOICES = set()  # Set of confirmed page indices
+
 def load_models():
     """Loads the VLM model for All-Page Scan."""
     global VLM_MODEL, VLM_TOKENIZER
@@ -24,12 +41,13 @@ def load_models():
 def process_pdf(pdf_file):
     """
     Converts PDF to images for All-Page Scan.
+    Returns: (status_text, gallery_images_list)
     """
     if pdf_file is None:
-        return "No PDF uploaded."
+        return "No PDF uploaded.", []
     
     if VLM_MODEL is None:
-        return "Model not loaded yet. Please wait."
+        return "Model not loaded yet. Please wait.", []
     
     try:
         # Robustly handle input
@@ -58,6 +76,7 @@ def process_pdf(pdf_file):
             print(f"Error converting PDF: {e}")
             raise e
 
+        saved_paths = []
         for i, image in enumerate(images):
             # MEMORY OPTIMIZATION: Resize if still too large
             w, h = image.size
@@ -69,6 +88,7 @@ def process_pdf(pdf_file):
             
             image_path = os.path.join(images_dir, f"page_{i}.png")
             image.save(image_path, "PNG", optimize=True)
+            saved_paths.append(os.path.abspath(image_path))
             
             # MEMORY OPTIMIZATION: Explicitly release image memory
             image.close()
@@ -79,12 +99,50 @@ def process_pdf(pdf_file):
         import gc
         gc.collect()
         
-        return f"✅ Converted {len(os.listdir(images_dir))} pages (DPI={TARGET_DPI}). Ready for All-Page Scan."
+        # Build gallery for preview
+        gallery = [(Image.open(p), f"Trang {i+1}") for i, p in enumerate(saved_paths)]
+        
+        num_pages = len(saved_paths)
+        return f"✅ Đã chuyển đổi {num_pages} trang (DPI={TARGET_DPI}). Đang trích xuất metadata...", gallery
         
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return f"Error processing PDF: {str(e)}"
+        return f"Error processing PDF: {str(e)}", []
+
+
+def upload_and_process(pdf_file):
+    """
+    Auto-trigger pipeline: upload → index (convert to images) → extract metadata.
+    Called automatically when user uploads a PDF.
+    Returns: status, gallery, 9 metadata fields, 8 checkboxes (False), 8 notes (""), confirm_status ("")
+    """
+    global CURRENT_PDF_FILENAME
+    
+    # Reset values for checkboxes + notes (8 fields x 2 = 16) + confirm status
+    reset_corrections = (False, "") * 8 + ("",)  # 8x(checkbox, note) + confirm_status
+    
+    # Track PDF filename
+    if pdf_file is not None:
+        if hasattr(pdf_file, 'name'):
+            CURRENT_PDF_FILENAME = os.path.basename(pdf_file.name)
+        else:
+            CURRENT_PDF_FILENAME = os.path.basename(str(pdf_file))
+    
+    # Step 1: Convert PDF to images
+    status, gallery = process_pdf(pdf_file)
+    
+    empty_meta = ("N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "")
+    
+    if "Error" in status or not gallery:
+        return (status, gallery, *empty_meta, *reset_corrections)
+    
+    # Step 2: Auto-extract metadata
+    metadata_results = extract_metadata()
+    
+    status = status.replace("Đang trích xuất metadata...", "Trích xuất metadata hoàn tất.")
+    
+    return (status, gallery, *metadata_results, *reset_corrections)
 
 def rag_response(user_query):
     """
@@ -569,9 +627,9 @@ def extract_metadata():
             "name": "signing_date", 
             "prompt": "Tìm dòng chứa 'Hôm nay, ngày' hoặc 'ký kết ngày' trong tài liệu và COPY NGUYÊN VĂN cả dòng đó. Ví dụ: 'Hôm nay, ngày 28 tháng 10 năm 2025' hoặc '...ký kết ngày 15 tháng 01 năm 2025...'. Chỉ trả lời dòng chứa ngày tháng, không giải thích. Nếu không tìm thấy, trả lời 'N/A'.",
             "format": "date",
-            "verify_prompt": "Trong trang này, có cụm từ 'Hôm nay, ngày' hoặc 'ký kết ngày' theo sau là ngày tháng năm không? Trả lời YES hoặc NO.",
+            "verify_prompt": "Trong trang này, có hiển thị ngày '{answer}' (dưới bất kỳ định dạng nào như 'ngày X tháng Y năm Z' hoặc 'DD/MM/YYYY') không? Trả lời YES hoặc NO.",
             "max_pages": 2,  # Only scan first 2 pages
-            "skip_verify": False,  # Keep verification
+            "skip_verify": True,  # Skip verification - regex extraction is strict enough
             "debug": True  # DEBUG enabled
         },
         {
@@ -581,7 +639,7 @@ def extract_metadata():
             "verify_prompt": "Trong trang này, có hiển thị GIÁ TRỊ HỢP ĐỒNG hoặc TỔNG GIÁ TRỊ kèm số tiền không? Trả lời YES hoặc NO.",
             "start_page": 2,  # Start from page 2
             "skip_last_percent": 0.5,  # Skip last 50% pages
-            "skip_verify": True,  # Skip verification - money regex is strict
+            "skip_verify": False,  # Verify contract value against page
             "debug": False
         },
         {
@@ -775,9 +833,26 @@ Chỉ trả lời đúng format, mỗi thông tin một dòng. Nếu không tìm
                     if numbers:
                         formatted_answer = numbers[0]
                 elif field['format'] == 'money':
-                    raw_number = re.sub(r'[^\d]', '', answer)
-                    if raw_number and len(raw_number) >= 5:
-                        formatted_answer = "{:,}".format(int(raw_number))
+                    # Smart money extraction: find actual monetary patterns
+                    # Match patterns like 288,000,000 or 288.000.000 or 179600000
+                    money_matches = re.findall(r'\b(\d{1,3}(?:[.,]\d{3})+)\b', answer)
+                    if money_matches:
+                        # Take the largest number found (most likely the total value)
+                        best_value = 0
+                        for m in money_matches:
+                            raw = re.sub(r'[^\d]', '', m)
+                            val = int(raw) if raw else 0
+                            if val > best_value:
+                                best_value = val
+                        if best_value >= 10000:  # At least 10,000
+                            formatted_answer = "{:,}".format(best_value)
+                    else:
+                        # Fallback: look for standalone large numbers
+                        num_matches = re.findall(r'\b(\d{5,})\b', answer)
+                        if num_matches:
+                            best_value = max(int(n) for n in num_matches)
+                            if best_value >= 10000:
+                                formatted_answer = "{:,}".format(best_value)
                 elif field['format'] == 'date':
                     # Try format: ngày X tháng Y năm Z
                     hom_nay_match = re.search(r'[Hh]ôm\s*nay[,\s]*ngày\s*(\d{1,2})\s*tháng\s*(\d{1,2})\s*năm\s*(\d{4})', answer, re.IGNORECASE)
@@ -952,13 +1027,28 @@ Chỉ trả lời đúng format, mỗi thông tin một dòng. Nếu không tìm
             print(f"      [DEBUG] Fallback page {page_num} raw: '{answer}'")
             
             if 'N/A' not in answer.upper() and len(answer) > 5:
-                # Parse money value
+                # Smart money extraction: find actual monetary patterns
                 import re
-                raw_number = re.sub(r'[^\d]', '', answer)
-                if raw_number and len(raw_number) >= 5:
-                    results['contract_value'] = "{:,}".format(int(raw_number))
-                    print(f"    ✓ contract_value (fallback): {results['contract_value']} (page {page_num})")
-                    break
+                money_matches = re.findall(r'\b(\d{1,3}(?:[.,]\d{3})+)\b', answer)
+                if money_matches:
+                    best_value = 0
+                    for m in money_matches:
+                        raw = re.sub(r'[^\d]', '', m)
+                        val = int(raw) if raw else 0
+                        if val > best_value:
+                            best_value = val
+                    if best_value >= 10000:
+                        results['contract_value'] = "{:,}".format(best_value)
+                        print(f"    ✓ contract_value (fallback): {results['contract_value']} (page {page_num})")
+                        break
+                else:
+                    num_matches = re.findall(r'\b(\d{5,})\b', answer)
+                    if num_matches:
+                        best_value = max(int(n) for n in num_matches)
+                        if best_value >= 10000:
+                            results['contract_value'] = "{:,}".format(best_value)
+                            print(f"    ✓ contract_value (fallback): {results['contract_value']} (page {page_num})")
+                            break
     
     # ========== FALLBACK: duration from appendix (last 30% pages) ==========
     if results.get('duration', 'N/A') == 'N/A':
@@ -1075,44 +1165,812 @@ Chỉ trả lời đúng format, mỗi thông tin một dòng. Nếu không tìm
     )
 
 
+def confirm_metadata(
+    contract_number, contract_name, signing_date,
+    contract_value, duration, party_a, party_b, expiry_date,
+    wrong_contract_number, note_contract_number,
+    wrong_contract_name, note_contract_name,
+    wrong_signing_date, note_signing_date,
+    wrong_contract_value, note_contract_value,
+    wrong_duration, note_duration,
+    wrong_party_a, note_party_a,
+    wrong_party_b, note_party_b,
+    wrong_expiry_date, note_expiry_date
+):
+    """
+    Save confirmed metadata to JSON data file for statistics.
+    Each field has its own wrong-flag and correction note.
+    """
+    try:
+        # Field definitions for iteration
+        field_defs = [
+            ("contract_number", contract_number, wrong_contract_number, note_contract_number, "Số hợp đồng"),
+            ("contract_name", contract_name, wrong_contract_name, note_contract_name, "Tên hợp đồng"),
+            ("signing_date", signing_date, wrong_signing_date, note_signing_date, "Ngày ký"),
+            ("contract_value", contract_value, wrong_contract_value, note_contract_value, "Giá trị HĐ"),
+            ("duration", duration, wrong_duration, note_duration, "Thời gian TH"),
+            ("party_a", party_a, wrong_party_a, note_party_a, "Bên A"),
+            ("party_b", party_b, wrong_party_b, note_party_b, "Bên B"),
+            ("expiry_date", expiry_date, wrong_expiry_date, note_expiry_date, "Ngày hết hạn"),
+        ]
+        
+        metadata = {}
+        corrections = {}
+        wrong_field_names = []
+        
+        for key, value, is_wrong, note, label in field_defs:
+            metadata[key] = value
+            if is_wrong:
+                wrong_field_names.append(label)
+                corrections[key] = {
+                    "is_wrong": True,
+                    "note": note or ""
+                }
+        
+        # Build record
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "pdf_filename": CURRENT_PDF_FILENAME or "unknown",
+            "metadata": metadata,
+            "corrections": {
+                "has_corrections": len(wrong_field_names) > 0,
+                "wrong_fields": wrong_field_names,
+                "details": corrections
+            }
+        }
+        
+        # Load existing records or create new
+        records = []
+        if os.path.exists(METADATA_RECORDS_FILE):
+            with open(METADATA_RECORDS_FILE, 'r', encoding='utf-8') as f:
+                records = json.load(f)
+        
+        records.append(record)
+        
+        # Save
+        with open(METADATA_RECORDS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        
+        # Status message
+        total = len(records)
+        if wrong_field_names:
+            fields_str = ", ".join(wrong_field_names)
+            return f"✅ Đã lưu (bản ghi #{total}). ⚠️ Sai: {fields_str}"
+        else:
+            return f"✅ Đã xác nhận & lưu thành công (bản ghi #{total})."
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"❌ Lỗi khi lưu: {str(e)}"
+
+
+
+def extract_single_invoice(page_path, page_num):
+    """Extract metadata from a single invoice page. Returns 10 fields."""
+    import re
+    
+    batch_prompt = """Đọc hoá đơn này và trả lời theo format sau (mỗi thông tin một dòng):
+SỐ HOÁ ĐƠN: [số hoá đơn - nằm ngay dưới dòng "Ký hiệu", chỉ gồm số]
+NGÀY HOÁ ĐƠN: [ngày/tháng/năm]
+LOẠI XĂNG DẦU: [tên loại xăng/dầu]
+SỐ LƯỢNG: [số lít - chỉ gồm số]
+ĐƠN GIÁ: [đơn giá/lít - chỉ gồm số]
+THÀNH TIỀN TRƯỚC THUẾ: [số tiền - chỉ gồm số]
+THUẾ SUẤT: [%]
+TIỀN THUẾ: [số tiền thuế - chỉ gồm số]
+TỔNG CỘNG: [tổng số tiền - chỉ gồm số]
+BIỂN SỐ XE: [biển số xe nếu có]
+
+Lưu ý: SỐ HOÁ ĐƠN nằm ở dòng ngay dưới "Ký hiệu:" và chỉ chứa chữ số.
+Các trường số tiền chỉ ghi số, không ghi chữ hay ký tự lạ.
+Nếu không tìm thấy, ghi N/A. Chỉ trả lời đúng format."""
+    
+    prompt = apply_chat_template(VLM_TOKENIZER, VLM_MODEL.config, batch_prompt, num_images=1)
+    result = generate(VLM_MODEL, VLM_TOKENIZER, prompt=prompt, image=page_path, max_tokens=500, temp=0.1, verbose=False)
+    
+    answer = result.text if hasattr(result, 'text') else str(result)
+    answer = answer.replace('<|im_start|>', '').replace('<|im_end|>', '').strip()
+    print(f"  [Page {page_num}] Raw:\n{answer}")
+    
+    field_patterns = [
+        ("invoice_number", r'SỐ\s*HOÁ\s*ĐƠN[:\s]*(.+?)(?:\n|$)'),
+        ("invoice_date", r'NGÀY\s*HOÁ\s*ĐƠN[:\s]*(.+?)(?:\n|$)'),
+        ("fuel_type", r'LOẠI\s*XĂNG\s*DẦU[:\s]*(.+?)(?:\n|$)'),
+        ("quantity", r'SỐ\s*LƯỢNG[:\s]*(.+?)(?:\n|$)'),
+        ("unit_price", r'ĐƠN\s*GIÁ[:\s]*(.+?)(?:\n|$)'),
+        ("amount_before_tax", r'THÀNH\s*TIỀN\s*TRƯỚC\s*THUẾ[:\s]*(.+?)(?:\n|$)'),
+        ("tax_rate", r'THUẾ\s*SUẤT[:\s]*(.+?)(?:\n|$)'),
+        ("tax_amount", r'TIỀN\s*THUẾ[:\s]*(.+?)(?:\n|$)'),
+        ("total_amount", r'TỔNG\s*CỘNG[:\s]*(.+?)(?:\n|$)'),
+        ("vehicle_plate", r'BIỂN\s*SỐ\s*XE[:\s]*(.+?)(?:\n|$)'),
+    ]
+    
+    results = {}
+    for key, pattern in field_patterns:
+        match = re.search(pattern, answer, re.IGNORECASE)
+        if match:
+            value = match.group(1).strip()
+            value = re.sub(r'^[\s"\'\'\'\'`]+|[\s"\'\'\'\'`]+$', '', value)
+            # Anti-hallucination: detect repeating patterns
+            if len(value) > 80:
+                found_repeat = False
+                for seg_len in range(15, min(80, len(value)//2)):
+                    segment = value[:seg_len]
+                    count = value.count(segment)
+                    if count >= 2:
+                        value = segment.rstrip(' -–,.')
+                        print(f"    [anti-repeat] {key}: truncated (repeated {count}x)")
+                        found_repeat = True
+                        break
+                if not found_repeat and len(value) > 200:
+                    value = value[:200].rstrip()
+            results[key] = value if value and value.upper() != 'N/A' else 'N/A'
+        else:
+            results[key] = 'N/A'
+    
+    # Post-processing: validate numeric fields — re-extract if invalid
+    reextract_fields = []
+    
+    # invoice_number must be digits only
+    inv_num = results.get('invoice_number', 'N/A')
+    if inv_num and inv_num != 'N/A':
+        if re.search(r'[^0-9]', inv_num):
+            print(f"    [validate] invoice_number '{inv_num}' has non-digits → re-extract")
+            reextract_fields.append(('invoice_number', 'SỐ HOÁ ĐƠN (chỉ gồm số, nằm ngay dưới dòng Ký hiệu)'))
+    
+    # Money/quantity fields: only digits, dots, commas allowed
+    money_prompts = {
+        'quantity': 'SỐ LƯỢNG (chỉ gồm số)',
+        'unit_price': 'ĐƠN GIÁ (chỉ gồm số)',
+        'amount_before_tax': 'THÀNH TIỀN TRƯỚC THUẾ (chỉ gồm số)',
+        'tax_amount': 'TIỀN THUẾ (chỉ gồm số)',
+        'total_amount': 'TỔNG CỘNG (chỉ gồm số)',
+    }
+    for field, hint in money_prompts.items():
+        value = results.get(field, 'N/A')
+        if value and value != 'N/A':
+            if re.search(r'[^0-9.,\s]', value):
+                print(f"    [validate] {field} '{value}' has invalid chars → re-extract")
+                reextract_fields.append((field, hint))
+    
+    # Re-extract failed fields with targeted prompt
+    if reextract_fields:
+        field_lines = "\n".join([hint for _, hint in reextract_fields])
+        retry_prompt_text = f"""Đọc lại hoá đơn này thật kỹ. Chỉ trả lời các trường sau, mỗi trường một dòng:
+{field_lines}
+
+CHÚ Ý:
+- SỐ HOÁ ĐƠN nằm ở dòng ngay dưới "Ký hiệu:" và CHỈ CHỨA CHỮ SỐ (0-9).
+- Các trường số tiền CHỈ CHỨA SỐ, dấu chấm và dấu phẩy. KHÔNG có chữ cái hay ký tự lạ.
+- Format: TÊN TRƯỜNG: giá trị"""
+        
+        print(f"    [re-extract] Retrying {len(reextract_fields)} fields: {[f for f,_ in reextract_fields]}")
+        
+        retry_prompt = apply_chat_template(VLM_TOKENIZER, VLM_MODEL.config, retry_prompt_text, num_images=1)
+        retry_result = generate(VLM_MODEL, VLM_TOKENIZER, prompt=retry_prompt, image=page_path, max_tokens=200, temp=0.05, verbose=False)
+        retry_answer = retry_result.text if hasattr(retry_result, 'text') else str(retry_result)
+        retry_answer = retry_answer.replace('<|im_start|>', '').replace('<|im_end|>', '').strip()
+        print(f"    [re-extract] Raw:\n{retry_answer}")
+        
+        retry_patterns = {
+            'invoice_number': r'SỐ\s*HOÁ\s*ĐƠN[^:]*[:\s]*(.+?)(?:\n|$)',
+            'quantity': r'SỐ\s*LƯỢNG[^:]*[:\s]*(.+?)(?:\n|$)',
+            'unit_price': r'ĐƠN\s*GIÁ[^:]*[:\s]*(.+?)(?:\n|$)',
+            'amount_before_tax': r'THÀNH\s*TIỀN[^:]*[:\s]*(.+?)(?:\n|$)',
+            'tax_amount': r'TIỀN\s*THUẾ[^:]*[:\s]*(.+?)(?:\n|$)',
+            'total_amount': r'TỔNG\s*CỘNG[^:]*[:\s]*(.+?)(?:\n|$)',
+        }
+        
+        for field, _ in reextract_fields:
+            pattern = retry_patterns.get(field)
+            if pattern:
+                match = re.search(pattern, retry_answer, re.IGNORECASE)
+                if match:
+                    new_val = match.group(1).strip().strip('"\'` ')
+                    if field == 'invoice_number':
+                        new_clean = re.sub(r'[^0-9]', '', new_val)
+                        if new_clean:
+                            print(f"    [re-extract] {field}: '{results[field]}' → '{new_clean}' ✅")
+                            results[field] = new_clean
+                        else:
+                            print(f"    [re-extract] {field}: retry also failed")
+                    else:
+                        if not re.search(r'[^0-9.,\s]', new_val):
+                            print(f"    [re-extract] {field}: '{results[field]}' → '{new_val.strip()}' ✅")
+                            results[field] = new_val.strip()
+                        else:
+                            fallback = re.sub(r'[^0-9.,]', '', new_val)
+                            if fallback:
+                                print(f"    [re-extract] {field}: still noisy, fallback → '{fallback}'")
+                                results[field] = fallback
+                            else:
+                                print(f"    [re-extract] {field}: retry failed")
+                else:
+                    print(f"    [re-extract] {field}: not found in retry")
+    
+    # Post-processing: normalize fuel type
+    KNOWN_FUELS = {
+        "E5 RON 92": ["e5", "ron 92", "e5 ron 92", "xăng e5", "xang e5", "e5ron92", "ron92"],
+        "RON 95-III": ["ron 95", "ron95", "xăng 95", "xang 95", "95-iii", "95 iii", "ron 95-iii"],
+        "RON 95-IV": ["95-iv", "95 iv", "ron 95-iv"],
+        "RON 95-V": ["95-v", "ron 95-v"],
+        "DO 0.05S-II": ["diesel", "do ", "do 0.05", "dầu diesel", "d.o", "0.05s", "0,05s"],
+        "DO 0.001S-V": ["0.001s", "0,001s"],
+        "Dầu hỏa": ["dầu hỏa", "kerosene", "dau hoa"],
+        "Dầu mazut": ["mazut", "fo ", "fuel oil"],
+    }
+    
+    fuel = results.get('fuel_type', 'N/A')
+    if fuel and fuel != 'N/A':
+        fuel_lower = fuel.lower().strip()
+        fuel_clean = re.sub(r'^(xăng|xang|dầu|dau)\s*', '', fuel_lower)
+        matched = None
+        for standard_name, keywords in KNOWN_FUELS.items():
+            for kw in keywords:
+                if kw in fuel_lower or kw in fuel_clean:
+                    matched = standard_name
+                    break
+            if matched:
+                break
+        if matched:
+            if matched != fuel:
+                print(f"    [post] fuel normalized: '{fuel}' → '{matched}'")
+                results['fuel_type'] = matched
+        else:
+            print(f"    [post] ⚠️ unknown fuel type: '{fuel}'")
+    
+    return results
+
+
+def check_is_invoice(page_path):
+    """Check if a page is a valid invoice by looking for 'HOÁ ĐƠN GIÁ TRỊ GIA TĂNG' in top 1/4."""
+    from PIL import Image
+    import tempfile
+    
+    try:
+        img = Image.open(page_path)
+        w, h = img.size
+        # Crop top 1/4
+        top_quarter = img.crop((0, 0, w, h // 4))
+        
+        # Save cropped image to temp file
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+            top_quarter.save(tmp.name)
+            crop_path = tmp.name
+        
+        check_prompt = """Trong ảnh này có tiêu đề "HOÁ ĐƠN GIÁ TRỊ GIA TĂNG" không?
+Chỉ trả lời CÓ hoặc KHÔNG."""
+        
+        prompt = apply_chat_template(VLM_TOKENIZER, VLM_MODEL.config, check_prompt, num_images=1)
+        result = generate(VLM_MODEL, VLM_TOKENIZER, prompt=prompt, image=crop_path, max_tokens=20, temp=0.05, verbose=False)
+        answer = result.text if hasattr(result, 'text') else str(result)
+        answer = answer.replace('<|im_start|>', '').replace('<|im_end|>', '').strip().upper()
+        
+        # Clean up temp file
+        os.remove(crop_path)
+        
+        is_invoice = 'CÓ' in answer or 'CO' in answer
+        print(f"    [title check] '{answer}' → {'✅ Invoice' if is_invoice else '❌ Not invoice'}")
+        return is_invoice
+        
+    except Exception as e:
+        print(f"    [title check] Error: {e} → assuming invoice")
+        return True  # On error, assume it's an invoice
+
+
+def extract_all_invoices():
+    """Extract metadata from ALL pages (batch processing). Each page = 1 invoice."""
+    global ALL_INVOICE_RESULTS, CONFIRMED_INVOICES, INVOICE_PAGE_PATHS
+    import time
+    start_time = time.time()
+    
+    ALL_INVOICE_RESULTS = []
+    CONFIRMED_INVOICES = set()
+    INVOICE_PAGE_PATHS = []
+    
+    if VLM_MODEL is None:
+        return "Model not loaded", 0
+    
+    images_dir = "temp_pdf_images"
+    if not os.path.exists(images_dir):
+        return "No PDF", 0
+    
+    image_files = sorted(
+        [f for f in os.listdir(images_dir) if f.endswith('.png') and f.startswith('page_')],
+        key=lambda x: int(x.split('_')[1].split('.')[0])
+    )
+    
+    if not image_files:
+        return "No pages", 0
+    
+    total = len(image_files)
+    skipped = 0
+    print(f"\n=== BATCH INVOICE EXTRACTION: {total} pages ===")
+    
+    for i, img_file in enumerate(image_files):
+        page_path = os.path.abspath(os.path.join(images_dir, img_file))
+        print(f"\n--- Page {i+1}/{total} ---")
+        
+        # Check if page is a valid invoice
+        if not check_is_invoice(page_path):
+            print(f"    ⏭️ Skipped page {i+1} (not an invoice)")
+            skipped += 1
+            continue
+        
+        result = extract_single_invoice(page_path, i+1)
+        ALL_INVOICE_RESULTS.append(result)
+        INVOICE_PAGE_PATHS.append(page_path)
+    
+    # Force garbage collection
+    import gc
+    gc.collect()
+    
+    elapsed = time.time() - start_time
+    minutes = int(elapsed // 60)
+    seconds = int(elapsed % 60)
+    extraction_time = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+    extracted = len(ALL_INVOICE_RESULTS)
+    print(f"\n⏱️ Batch completed: {extracted} invoices extracted, {skipped} skipped, in {extraction_time}")
+    
+    return extraction_time, extracted
+def load_invoice_page(page_idx):
+    """Load metadata for a specific page. Returns tuple of 10 fields + reset corrections."""
+    page_idx = int(page_idx) - 1  # Convert 1-based to 0-based
+    
+    # Reset values for corrections (10 fields)
+    reset_corrections = tuple([False, ""] * 10)
+    
+    if page_idx < 0 or page_idx >= len(ALL_INVOICE_RESULTS):
+        empty = tuple(["N/A"] * 10)
+        return (*empty, "", *reset_corrections, "")
+    
+    r = ALL_INVOICE_RESULTS[page_idx]
+    
+    # Confirm status for this page
+    confirmed = page_idx in CONFIRMED_INVOICES
+    confirm_text = f"✅ Đã xác nhận trang {page_idx+1}" if confirmed else ""
+    batch_status = f"Đã xác nhận {len(CONFIRMED_INVOICES)}/{len(ALL_INVOICE_RESULTS)} hoá đơn"
+    
+    return (
+        r.get('invoice_number', 'N/A'),
+        r.get('invoice_date', 'N/A'),
+        r.get('fuel_type', 'N/A'),
+        r.get('quantity', 'N/A'),
+        r.get('unit_price', 'N/A'),
+        r.get('amount_before_tax', 'N/A'),
+        r.get('tax_rate', 'N/A'),
+        r.get('tax_amount', 'N/A'),
+        r.get('total_amount', 'N/A'),
+        r.get('vehicle_plate', 'N/A'),
+        batch_status,
+        *reset_corrections,
+        confirm_text
+    )
+
+
+def upload_and_process_invoices(pdf_file):
+    """Upload PDF, convert to images, extract all invoice pages. Returns 10 fields."""
+    global CURRENT_INVOICE_FILENAME, ALL_INVOICE_RESULTS, CONFIRMED_INVOICES, INVOICE_PAGE_PATHS
+    
+    ALL_INVOICE_RESULTS = []
+    CONFIRMED_INVOICES = set()
+    INVOICE_PAGE_PATHS = []
+    
+    reset_corrections = tuple([False, ""] * 10)
+    empty_meta = tuple(["N/A"] * 10)
+    
+    if pdf_file is not None:
+        if hasattr(pdf_file, 'name'):
+            CURRENT_INVOICE_FILENAME = os.path.basename(pdf_file.name)
+        else:
+            CURRENT_INVOICE_FILENAME = os.path.basename(str(pdf_file))
+    
+    status, gallery = process_pdf(pdf_file)
+    
+    if "Error" in status or not gallery:
+        return (status, gallery, *empty_meta, "0/0", *reset_corrections, "",
+                gr.update(maximum=1, value=1, label="Hoá đơn 1/1"))
+    
+    total_pages = len(gallery)
+    extraction_time, count = extract_all_invoices()
+    
+    # Build gallery with only invoice pages
+    invoice_gallery = INVOICE_PAGE_PATHS if INVOICE_PAGE_PATHS else gallery
+    
+    status = f"✅ Đã trích xuất {count}/{total_pages} hoá đơn ({extraction_time})"
+    
+    # Load page 1
+    if ALL_INVOICE_RESULTS:
+        page_data = load_invoice_page(1)
+        return (status, invoice_gallery, *page_data,
+                gr.update(maximum=count, value=1, label=f"Hoá đơn 1/{count}"))
+    else:
+        return (status, invoice_gallery, *empty_meta, f"0/{total_pages}", *reset_corrections, "",
+                gr.update(maximum=1, value=1, label="Hoá đơn 1/1"))
+def confirm_current_invoice(
+    page_idx,
+    invoice_number, invoice_date, fuel_type, quantity,
+    unit_price, amount_before_tax, tax_rate, tax_amount,
+    total_amount, vehicle_plate,
+    w_invoice_number, n_invoice_number,
+    w_invoice_date, n_invoice_date,
+    w_fuel_type, n_fuel_type,
+    w_quantity, n_quantity,
+    w_unit_price, n_unit_price,
+    w_amount_before_tax, n_amount_before_tax,
+    w_tax_rate, n_tax_rate,
+    w_tax_amount, n_tax_amount,
+    w_total_amount, n_total_amount,
+    w_vehicle_plate, n_vehicle_plate
+):
+    """Save confirmed invoice metadata for current page to JSON."""
+    global CONFIRMED_INVOICES
+    try:
+        page_idx = int(page_idx)
+        
+        field_defs = [
+            ("invoice_number", invoice_number, w_invoice_number, n_invoice_number, "Số HĐ"),
+            ("invoice_date", invoice_date, w_invoice_date, n_invoice_date, "Ngày HĐ"),
+            ("fuel_type", fuel_type, w_fuel_type, n_fuel_type, "Loại XD"),
+            ("quantity", quantity, w_quantity, n_quantity, "Số lượng"),
+            ("unit_price", unit_price, w_unit_price, n_unit_price, "Đơn giá"),
+            ("amount_before_tax", amount_before_tax, w_amount_before_tax, n_amount_before_tax, "Trước thuế"),
+            ("tax_rate", tax_rate, w_tax_rate, n_tax_rate, "Thuế suất"),
+            ("tax_amount", tax_amount, w_tax_amount, n_tax_amount, "Tiền thuế"),
+            ("total_amount", total_amount, w_total_amount, n_total_amount, "Tổng cộng"),
+            ("vehicle_plate", vehicle_plate, w_vehicle_plate, n_vehicle_plate, "Biển số"),
+        ]
+        
+        metadata = {}
+        corrections = {}
+        wrong_field_names = []
+        
+        for key, value, is_wrong, note, label in field_defs:
+            metadata[key] = value
+            if is_wrong:
+                wrong_field_names.append(label)
+                corrections[key] = {"is_wrong": True, "note": note or ""}
+        
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "pdf_filename": CURRENT_INVOICE_FILENAME or "unknown",
+            "page_number": page_idx,
+            "type": "fuel_invoice",
+            "metadata": metadata,
+            "corrections": {
+                "has_corrections": len(wrong_field_names) > 0,
+                "wrong_fields": wrong_field_names,
+                "details": corrections
+            }
+        }
+        
+        records = []
+        if os.path.exists(INVOICE_RECORDS_FILE):
+            with open(INVOICE_RECORDS_FILE, 'r', encoding='utf-8') as f:
+                records = json.load(f)
+        
+        records.append(record)
+        
+        with open(INVOICE_RECORDS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        
+        # Mark as confirmed
+        CONFIRMED_INVOICES.add(page_idx - 1)
+        
+        total_records = len(records)
+        confirmed_count = len(CONFIRMED_INVOICES)
+        total_invoices = len(ALL_INVOICE_RESULTS)
+        
+        status = f"✅ Trang {page_idx} đã lưu (bản ghi #{total_records}). Xác nhận {confirmed_count}/{total_invoices}"
+        if wrong_field_names:
+            status += f" | ⚠️ Sai: {', '.join(wrong_field_names)}"
+        
+        # Auto-advance to next page
+        next_page = page_idx + 1
+        if next_page <= total_invoices:
+            next_data = load_invoice_page(next_page)
+            # next_data = (10 fields, batch_status, 20 corrections, confirm_text)
+            # We return: status, 10 fields, batch_status, 20 corrections, slider_update, gallery_update
+            return (
+                status,
+                *next_data[:-1],  # All except confirm_text (31 values)
+                gr.update(value=next_page),  # slider
+                gr.update(selected_index=next_page - 1)  # gallery
+            )
+        else:
+            # Already at last page, stay
+            reset_corrections = tuple([False, ""] * 10)
+            return (
+                status + " | 🎉 Đã hoàn thành tất cả!",
+                *[gr.update()] * 10,  # keep current fields
+                f"✅ Hoàn thành {confirmed_count}/{total_invoices}",
+                *reset_corrections,
+                gr.update(),  # slider stays
+                gr.update()   # gallery stays
+            )
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        reset_corrections = tuple([False, ""] * 10)
+        return (
+            f"❌ Lỗi khi lưu: {str(e)}",
+            *[gr.update()] * 10,
+            gr.update(),
+            *reset_corrections,
+            gr.update(),
+            gr.update()
+        )
+def generate_dashboard():
+    """Generate extraction accuracy dashboard from invoice_records.json."""
+    from collections import Counter
+    
+    if not os.path.exists(INVOICE_RECORDS_FILE):
+        return "⚠️ Chưa có dữ liệu. Hãy xác nhận hoá đơn trước.", "", ""
+    
+    try:
+        with open(INVOICE_RECORDS_FILE, 'r', encoding='utf-8') as f:
+            records = json.load(f)
+    except Exception:
+        return "❌ Lỗi đọc file dữ liệu.", "", ""
+    
+    if not records:
+        return "⚠️ Chưa có bản ghi nào.", "", ""
+    
+    total = len(records)
+    correct = sum(1 for r in records if not r['corrections']['has_corrections'])
+    wrong = total - correct
+    accuracy = (correct / total) * 100 if total > 0 else 0
+    
+    # Per-field error count
+    field_labels = {
+        'Số HĐ': 'invoice_number', 'Ngày HĐ': 'invoice_date',
+        'Loại XD': 'fuel_type', 'Số lượng': 'quantity',
+        'Đơn giá': 'unit_price', 'Trước thuế': 'amount_before_tax',
+        'Thuế suất': 'tax_rate', 'Tiền thuế': 'tax_amount',
+        'Tổng cộng': 'total_amount', 'Biển số': 'vehicle_plate'
+    }
+    
+    field_errors = Counter()
+    for r in records:
+        for field in r['corrections']['wrong_fields']:
+            field_errors[field] += 1
+    
+    # Overview markdown
+    bar_correct = '🟩' * int(accuracy / 5)
+    bar_wrong = '🟥' * (20 - int(accuracy / 5))
+    overview = f"""## 📊 Tổng quan trích xuất hoá đơn
+
+| Chỉ số | Giá trị |
+|--------|--------|
+| 📄 Tổng hoá đơn | **{total}** |
+| ✅ Đúng hoàn toàn | **{correct}** ({accuracy:.1f}%) |
+| ⚠️ Có lỗi | **{wrong}** ({100-accuracy:.1f}%) |
+| 📊 Tổng lỗi | **{sum(field_errors.values())}** trường sai |
+
+### Độ chính xác tổng thể
+{bar_correct}{bar_wrong} **{accuracy:.1f}%**
+"""
+    
+    # Per-field accuracy table
+    field_table = "## 📋 Độ chính xác theo trường\n\n"
+    field_table += "| Trường | Số lỗi | Tỷ lệ đúng | Biểu đồ |\n"
+    field_table += "|--------|--------|-----------|---------|\n"
+    
+    for label in field_labels:
+        errors = field_errors.get(label, 0)
+        field_acc = ((total - errors) / total) * 100
+        bar_len = int(field_acc / 10)
+        bar = '█' * bar_len + '░' * (10 - bar_len)
+        icon = '✅' if errors == 0 else ('⚠️' if errors <= 5 else '❌')
+        field_table += f"| {icon} {label} | {errors}/{total} | {field_acc:.0f}% | `{bar}` |\n"
+    
+    # Most common errors detail
+    error_detail = "## 🔍 Chi tiết lỗi thường gặp\n\n"
+    if field_errors:
+        for label, count in field_errors.most_common():
+            pct = (count / total) * 100
+            error_detail += f"### {label} — {count} lỗi ({pct:.0f}%)\n"
+            # Show examples
+            examples = []
+            for r in records:
+                if label in r['corrections']['wrong_fields']:
+                    detail = r['corrections']['details']
+                    field_key = field_labels.get(label, '')
+                    if field_key in detail:
+                        extracted = r['metadata'].get(field_key, 'N/A')
+                        note = detail[field_key].get('note', '')
+                        if note:
+                            examples.append(f"  - `{extracted}` → `{note}` (trang {r.get('page_number', '?')})")
+                    if len(examples) >= 3:
+                        break
+            if examples:
+                error_detail += "\n".join(examples) + "\n\n"
+            else:
+                error_detail += "\n"
+    else:
+        error_detail += "🎉 Không có lỗi nào!\n"
+    
+    return overview, field_table, error_detail
+
+
 # Initialize UI
 with gr.Blocks(title="Local Vision RAG (MacOS M5)", css="""
     .gallery-item { cursor: pointer; }
+    .pdf-preview-gallery { min-height: 500px; }
+    .metadata-section { padding: 8px 0; }
+    #invoice-meta-col .gr-group { gap: 2px !important; }
+    #invoice-meta-col .gr-block { padding: 4px 8px !important; min-height: 0 !important; }
+    #invoice-meta-col .gr-box { padding: 2px !important; min-height: 0 !important; }
+    #invoice-meta-col .row { gap: 4px !important; }
+    #invoice-meta-col textarea, #invoice-meta-col input { padding: 4px 6px !important; font-size: 13px !important; }
+    #invoice-meta-col label { font-size: 11px !important; margin-bottom: 0 !important; }
 """) as demo:
-    gr.Markdown("# 👁️ Local Vision RAG Demo\n**Retrieval:** Byaldi (ColPali) | **Generation:** MLX-VLM (Qwen3-VL-30B-A3B-3bit)")
+    gr.Markdown("# 👁️ Local Vision RAG Demo\n**Generation:** MLX-VLM (Qwen3-VL-30B-A3B-3bit) | Upload PDF để tự động trích xuất metadata")
     
-    with gr.Row():
-        with gr.Column(scale=1):
-            pdf_input = gr.File(label="Upload PDF Contract", file_types=[".pdf"])
-            process_btn = gr.Button("Index PDF", variant="primary")
-            status_output = gr.Textbox(label="Status", interactive=False)
+    with gr.Tabs():
+        # ==================== TAB 1: HỢP ĐỒNG ====================
+        with gr.Tab("📄 Hợp đồng"):
+            with gr.Row(equal_height=False):
+                # LEFT: Upload + PDF Preview
+                with gr.Column(scale=3):
+                    pdf_input = gr.File(label="📤 Upload PDF Hợp đồng", file_types=[".pdf"])
+                    status_output = gr.Textbox(label="Trạng thái", interactive=False)
+                    gr.Markdown("### 📄 Xem trước tài liệu")
+                    pdf_preview_gallery = gr.Gallery(
+                        label="PDF Preview",
+                        show_label=False,
+                        columns=2,
+                        height=600,
+                        allow_preview=True,
+                        preview=True,
+                        elem_classes=["pdf-preview-gallery"]
+                    )
+                
+                # RIGHT: Contract Metadata
+                with gr.Column(scale=2):
+                    gr.Markdown("### 📋 Metadata (tự động trích xuất)")
+                    extract_btn = gr.Button("🔍 Trích xuất lại Metadata", variant="secondary", size="sm")
+                    
+                    with gr.Group():
+                        with gr.Row():
+                            contract_number_output = gr.Textbox(label="Số hợp đồng", interactive=False, scale=3)
+                            wrong_contract_number = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            note_contract_number = gr.Textbox(label="Ghi chú", placeholder="Giá trị đúng...", interactive=True, scale=2)
+                        
+                        with gr.Row():
+                            contract_name_output = gr.Textbox(label="Tên HĐ / Gói thầu", interactive=False, scale=3)
+                            wrong_contract_name = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            note_contract_name = gr.Textbox(label="Ghi chú", placeholder="Giá trị đúng...", interactive=True, scale=2)
+                        
+                        with gr.Row():
+                            signing_date_output = gr.Textbox(label="Ngày ký", interactive=False, scale=3)
+                            wrong_signing_date = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            note_signing_date = gr.Textbox(label="Ghi chú", placeholder="Giá trị đúng...", interactive=True, scale=2)
+                        
+                        with gr.Row():
+                            contract_value_output = gr.Textbox(label="Giá trị HĐ (VNĐ)", interactive=False, scale=3)
+                            wrong_contract_value = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            note_contract_value = gr.Textbox(label="Ghi chú", placeholder="Giá trị đúng...", interactive=True, scale=2)
+                        
+                        with gr.Row():
+                            duration_output = gr.Textbox(label="Thời gian TH", interactive=False, scale=3)
+                            wrong_duration = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            note_duration = gr.Textbox(label="Ghi chú", placeholder="Giá trị đúng...", interactive=True, scale=2)
+                        
+                        with gr.Row():
+                            party_a_output = gr.Textbox(label="Bên A", interactive=False, scale=3)
+                            wrong_party_a = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            note_party_a = gr.Textbox(label="Ghi chú", placeholder="Giá trị đúng...", interactive=True, scale=2)
+                        
+                        with gr.Row():
+                            party_b_output = gr.Textbox(label="Bên B", interactive=False, scale=3)
+                            wrong_party_b = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            note_party_b = gr.Textbox(label="Ghi chú", placeholder="Giá trị đúng...", interactive=True, scale=2)
+                        
+                        with gr.Row():
+                            expiry_date_output = gr.Textbox(label="Ngày hết hạn", interactive=False, scale=3)
+                            wrong_expiry_date = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            note_expiry_date = gr.Textbox(label="Ghi chú", placeholder="Giá trị đúng...", interactive=True, scale=2)
+                        
+                        extraction_time_output = gr.Textbox(label="⏱️ Thời gian trích xuất", interactive=False)
+                    
+                    confirm_btn = gr.Button("✅ Xác nhận & Lưu Metadata", variant="primary")
+                    confirm_status_output = gr.Textbox(label="💾 Trạng thái lưu", interactive=False)
+        
+        # ==================== TAB 2: HOÁ ĐƠN XĂNG DẦU ====================
+        with gr.Tab("⛽ Hoá đơn xăng dầu"):
+            with gr.Row(equal_height=False):
+                # LEFT: Upload + Preview
+                with gr.Column(scale=3):
+                    inv_pdf_input = gr.File(label="📤 Upload PDF Hoá đơn (nhiều trang)", file_types=[".pdf", ".jpg", ".jpeg", ".png"])
+                    inv_status_output = gr.Textbox(label="Trạng thái", interactive=False)
+                    gr.Markdown("### 📄 Xem trước hoá đơn")
+                    inv_preview_gallery = gr.Gallery(
+                        label="Invoice Preview",
+                        show_label=False,
+                        columns=2,
+                        height=600,
+                        allow_preview=True,
+                        preview=True,
+                        elem_classes=["pdf-preview-gallery"]
+                    )
+                
+                # RIGHT: Invoice Metadata
+                with gr.Column(scale=2, elem_id="invoice-meta-col"):
+                    gr.Markdown("### ⛽ Metadata Hoá đơn")
+                    
+                    with gr.Row():
+                        inv_page_slider = gr.Slider(minimum=1, maximum=1, step=1, value=1, label="Hoá đơn 1/1", scale=3)
+                        inv_batch_status = gr.Textbox(label="Tiến độ", interactive=False, scale=2)
+                    
+                    with gr.Group():
+                        with gr.Row():
+                            inv_number = gr.Textbox(label="Số hoá đơn", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_inv_number = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_inv_number = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                        with gr.Row():
+                            inv_date = gr.Textbox(label="Ngày hoá đơn", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_inv_date = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_inv_date = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                        with gr.Row():
+                            inv_fuel_type = gr.Textbox(label="Loại xăng/dầu", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_fuel_type = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_fuel_type = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                        with gr.Row():
+                            inv_quantity = gr.Textbox(label="Số lượng (lít)", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_quantity = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_quantity = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                        with gr.Row():
+                            inv_unit_price = gr.Textbox(label="Đơn giá", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_unit_price = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_unit_price = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                        with gr.Row():
+                            inv_amount_before_tax = gr.Textbox(label="Trước thuế", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_amount_before_tax = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_amount_before_tax = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                        with gr.Row():
+                            inv_tax_rate = gr.Textbox(label="Thuế suất (%)", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_tax_rate = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_tax_rate = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                        with gr.Row():
+                            inv_tax_amount = gr.Textbox(label="Tiền thuế", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_tax_amount = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_tax_amount = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                        with gr.Row():
+                            inv_total_amount = gr.Textbox(label="Tổng cộng", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_total_amount = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_total_amount = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                        with gr.Row():
+                            inv_vehicle_plate = gr.Textbox(label="Biển số xe", interactive=False, scale=3, lines=1, max_lines=1)
+                            w_vehicle_plate = gr.Checkbox(label="Sai?", value=False, scale=1)
+                            n_vehicle_plate = gr.Textbox(label="Sửa", placeholder="Giá trị đúng...", interactive=True, scale=2, lines=1, max_lines=1)
+                    
+                    
+                    inv_confirm_btn = gr.Button("✅ Xác nhận & Lưu Hoá đơn này", variant="primary")
+                    inv_confirm_status = gr.Textbox(label="💾 Trạng thái lưu", interactive=False)
+        
+        # ==================== TAB 3: DASHBOARD ====================
+        with gr.Tab("📊 Dashboard"):
+            dashboard_refresh_btn = gr.Button("🔄 Cập nhật Dashboard", variant="primary")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    dashboard_overview = gr.Markdown(value="_Nhấn 'Cập nhật Dashboard' để xem thống kê_")
+                with gr.Column(scale=1):
+                    dashboard_fields = gr.Markdown(value="")
+            dashboard_errors = gr.Markdown(value="")
     
-    # Metadata Extraction Section
     gr.Markdown("---")
-    gr.Markdown("### 📋 Metadata Extraction")
-    with gr.Row():
-        extract_btn = gr.Button("🔍 Extract Metadata", variant="secondary")
-        extraction_time_output = gr.Textbox(label="⏱️ Thời gian trích xuất", interactive=False, scale=1)
-    with gr.Row():
-        contract_number_output = gr.Textbox(label="Số hợp đồng", interactive=True, scale=1)
-        contract_name_output = gr.Textbox(label="Tên hợp đồng", interactive=True, scale=2)
-        signing_date_output = gr.Textbox(label="Ngày ký hợp đồng", interactive=True, scale=1)
-        contract_value_output = gr.Textbox(label="Giá trị hợp đồng (VNĐ)", interactive=True, scale=1)
-        duration_output = gr.Textbox(label="Thời gian thực hiện", interactive=True, scale=1)
-    with gr.Row():
-        party_a_output = gr.Textbox(label="Bên A", interactive=True, scale=1)
-        party_b_output = gr.Textbox(label="Bên B", interactive=True, scale=1)
-        expiry_date_output = gr.Textbox(label="Ngày hết hạn", interactive=True, scale=1)
     
-    gr.Markdown("---")
-    
+    # ===== Q&A (full width, outside tabs) =====
     with gr.Row():
-        query_input = gr.Textbox(label="Ask a question about the document", placeholder="e.g., ngày ký hợp đồng?", scale=3)
-        submit_btn = gr.Button("Get Answer", variant="primary", scale=1)
+        query_input = gr.Textbox(label="Đặt câu hỏi về tài liệu", placeholder="Ví dụ: ngày ký hợp đồng? giá trị bảo lãnh?", scale=3)
+        submit_btn = gr.Button("Trả lời", variant="primary", scale=1)
 
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### 📄 Retrieved Pages (click to regenerate from that page)")
+            gr.Markdown("### 📄 Trang liên quan (click để xem lại từ trang đó)")
             retrieved_gallery = gr.Gallery(
                 label="Retrieved Pages",
                 show_label=False,
@@ -1122,26 +1980,169 @@ with gr.Blocks(title="Local Vision RAG (MacOS M5)", css="""
                 preview=True
             )
             selected_page = gr.Number(label="Selected Page Index", visible=False)
-            regenerate_btn = gr.Button("🔄 Regenerate from Selected Page", variant="secondary")
+            regenerate_btn = gr.Button("🔄 Trả lời lại từ trang đã chọn", variant="secondary")
         
         with gr.Column(scale=1):
-            gr.Markdown("### 💬 Answer")
+            gr.Markdown("### 💬 Câu trả lời")
             answer_output = gr.Markdown(label="Answer")
 
-    # Event Handlers
-    process_btn.click(
-        fn=process_pdf,
+    # ===== EVENT HANDLERS: CONTRACT TAB =====
+    
+    pdf_input.change(
+        fn=upload_and_process,
         inputs=[pdf_input],
-        outputs=[status_output]
+        outputs=[
+            status_output, pdf_preview_gallery,
+            contract_number_output, contract_name_output,
+            signing_date_output, contract_value_output,
+            duration_output, party_a_output, party_b_output,
+            expiry_date_output, extraction_time_output,
+            wrong_contract_number, note_contract_number,
+            wrong_contract_name, note_contract_name,
+            wrong_signing_date, note_signing_date,
+            wrong_contract_value, note_contract_value,
+            wrong_duration, note_duration,
+            wrong_party_a, note_party_a,
+            wrong_party_b, note_party_b,
+            wrong_expiry_date, note_expiry_date,
+            confirm_status_output
+        ]
     )
     
+    extract_btn.click(
+        fn=extract_metadata,
+        inputs=[],
+        outputs=[
+            contract_number_output, contract_name_output,
+            signing_date_output, contract_value_output,
+            duration_output, party_a_output, party_b_output,
+            expiry_date_output, extraction_time_output
+        ]
+    )
+    
+    confirm_btn.click(
+        fn=confirm_metadata,
+        inputs=[
+            contract_number_output, contract_name_output,
+            signing_date_output, contract_value_output,
+            duration_output, party_a_output, party_b_output,
+            expiry_date_output,
+            wrong_contract_number, note_contract_number,
+            wrong_contract_name, note_contract_name,
+            wrong_signing_date, note_signing_date,
+            wrong_contract_value, note_contract_value,
+            wrong_duration, note_duration,
+            wrong_party_a, note_party_a,
+            wrong_party_b, note_party_b,
+            wrong_expiry_date, note_expiry_date
+        ],
+        outputs=[confirm_status_output]
+    )
+    
+    # ===== EVENT HANDLERS: INVOICE TAB =====
+    
+    # Upload PDF → batch extract all invoices
+    inv_pdf_input.change(
+        fn=upload_and_process_invoices,
+        inputs=[inv_pdf_input],
+        outputs=[
+            inv_status_output, inv_preview_gallery,
+            inv_number, inv_date, inv_fuel_type, inv_quantity,
+            inv_unit_price, inv_amount_before_tax, inv_tax_rate,
+            inv_tax_amount, inv_total_amount, inv_vehicle_plate,
+            inv_batch_status,
+            w_inv_number, n_inv_number,
+            w_inv_date, n_inv_date,
+            w_fuel_type, n_fuel_type,
+            w_quantity, n_quantity,
+            w_unit_price, n_unit_price,
+            w_amount_before_tax, n_amount_before_tax,
+            w_tax_rate, n_tax_rate,
+            w_tax_amount, n_tax_amount,
+            w_total_amount, n_total_amount,
+            w_vehicle_plate, n_vehicle_plate,
+            inv_confirm_status,
+            inv_page_slider
+        ]
+    )
+    
+    # Page slider → load that page's metadata
+    inv_page_slider.change(
+        fn=load_invoice_page,
+        inputs=[inv_page_slider],
+        outputs=[
+            inv_number, inv_date, inv_fuel_type, inv_quantity,
+            inv_unit_price, inv_amount_before_tax, inv_tax_rate,
+            inv_tax_amount, inv_total_amount, inv_vehicle_plate,
+            inv_batch_status,
+            w_inv_number, n_inv_number,
+            w_inv_date, n_inv_date,
+            w_fuel_type, n_fuel_type,
+            w_quantity, n_quantity,
+            w_unit_price, n_unit_price,
+            w_amount_before_tax, n_amount_before_tax,
+            w_tax_rate, n_tax_rate,
+            w_tax_amount, n_tax_amount,
+            w_total_amount, n_total_amount,
+            w_vehicle_plate, n_vehicle_plate,
+            inv_confirm_status
+        ]
+    )
+    
+    # Confirm current page → auto-advance to next
+    inv_confirm_btn.click(
+        fn=confirm_current_invoice,
+        inputs=[
+            inv_page_slider,
+            inv_number, inv_date, inv_fuel_type, inv_quantity,
+            inv_unit_price, inv_amount_before_tax, inv_tax_rate,
+            inv_tax_amount, inv_total_amount, inv_vehicle_plate,
+            w_inv_number, n_inv_number,
+            w_inv_date, n_inv_date,
+            w_fuel_type, n_fuel_type,
+            w_quantity, n_quantity,
+            w_unit_price, n_unit_price,
+            w_amount_before_tax, n_amount_before_tax,
+            w_tax_rate, n_tax_rate,
+            w_tax_amount, n_tax_amount,
+            w_total_amount, n_total_amount,
+            w_vehicle_plate, n_vehicle_plate
+        ],
+        outputs=[
+            inv_confirm_status,
+            inv_number, inv_date, inv_fuel_type, inv_quantity,
+            inv_unit_price, inv_amount_before_tax, inv_tax_rate,
+            inv_tax_amount, inv_total_amount, inv_vehicle_plate,
+            inv_batch_status,
+            w_inv_number, n_inv_number,
+            w_inv_date, n_inv_date,
+            w_fuel_type, n_fuel_type,
+            w_quantity, n_quantity,
+            w_unit_price, n_unit_price,
+            w_amount_before_tax, n_amount_before_tax,
+            w_tax_rate, n_tax_rate,
+            w_tax_amount, n_tax_amount,
+            w_total_amount, n_total_amount,
+            w_vehicle_plate, n_vehicle_plate,
+            inv_page_slider,
+            inv_preview_gallery
+        ]
+    )
+    
+    # ===== EVENT HANDLERS: DASHBOARD TAB =====
+    dashboard_refresh_btn.click(
+        fn=generate_dashboard,
+        inputs=[],
+        outputs=[dashboard_overview, dashboard_fields, dashboard_errors]
+    )
+    
+    # ===== Q&A HANDLERS =====
     submit_btn.click(
         fn=rag_response,
         inputs=[query_input],
         outputs=[retrieved_gallery, answer_output]
     )
     
-    # Gallery selection handler
     def on_gallery_select(evt: gr.SelectData):
         return evt.index
     
@@ -1154,13 +2155,6 @@ with gr.Blocks(title="Local Vision RAG (MacOS M5)", css="""
         fn=rag_response_with_page,
         inputs=[query_input, selected_page],
         outputs=[answer_output]
-    )
-    
-    # Metadata extraction handler
-    extract_btn.click(
-        fn=extract_metadata,
-        inputs=[],
-        outputs=[contract_number_output, contract_name_output, signing_date_output, contract_value_output, duration_output, party_a_output, party_b_output, expiry_date_output, extraction_time_output]
     )
 
 if __name__ == "__main__":
